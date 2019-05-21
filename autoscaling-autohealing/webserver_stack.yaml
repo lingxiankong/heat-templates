@@ -1,0 +1,161 @@
+heat_template_version: 2016-10-14
+
+description: |
+  The heat template is used to demo the autoscaling and autohealing for a webserver.
+parameters:
+  keypair:
+    type: string
+    default: lingxian_key
+  webserver_port:
+    type: number
+    default: 80
+  webserver_image_id:
+    type: string
+    default: b37c3d78-3bed-481a-820c-3149b375db14
+  webserver_flavor_id:
+    type: string
+    default: m1.tiny
+  webserver_network_id:
+    type: string
+    default: 9235ffe5-673c-4d0e-b7fb-c00d7fe641eb
+  vip_subnet_id:
+    type: string
+    default: b1ff164f-b156-4cf9-938e-c3652b63c2fc
+  scaleup_cpu_threshold:
+    type: number
+    default: 80
+  scaledown_cpu_threshold:
+    type: number
+    default: 5
+  public_network:
+    type: string
+    default: public
+
+resources:
+  autoscaling_group:
+    type: OS::Heat::AutoScalingGroup
+    properties:
+      min_size: 2
+      max_size: 4
+      resource:
+        type: OS::LB::Server
+        properties:
+          keypair: {get_param: keypair}
+          image_id: {get_param: webserver_image_id}
+          flavor_id: {get_param: webserver_flavor_id}
+          network_id: {get_param: webserver_network_id}
+          pool_id: {get_resource: loadbalancer_pool}
+          metadata: {"metering.server_group": {get_param: "OS::stack_id"}}
+  loadbalancer:
+    type: OS::Octavia::LoadBalancer
+    properties:
+      vip_subnet: {get_param: vip_subnet_id}
+      name: webserver_lb
+  loadbalancer_public_ip:
+    type: OS::Neutron::FloatingIP
+    properties:
+      floating_network: {get_param: public_network}
+      port_id: {get_attr: [loadbalancer, vip_port_id]}
+  listener:
+    type: OS::Octavia::Listener
+    properties:
+      name: webserver_listener
+      protocol: HTTP
+      protocol_port: 80
+      loadbalancer: {get_resource: loadbalancer}
+  loadbalancer_pool:
+    type: OS::Octavia::Pool
+    properties:
+      lb_algorithm: ROUND_ROBIN
+      protocol: HTTP
+      listener: {get_resource: listener}
+  loadbalancer_healthmonitor:
+    type: OS::Octavia::HealthMonitor
+    properties:
+      delay: 5
+      max_retries: 3
+      pool: {get_resource: loadbalancer_pool}
+      timeout: 5000
+      type: HTTP
+      http_method: GET
+      expected_codes: 200
+  scaleup_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: autoscaling_group}
+      scaling_adjustment: 1
+      cooldown: 60
+  scaledown_policy:
+    type: OS::Heat::ScalingPolicy
+    properties:
+      adjustment_type: change_in_capacity
+      auto_scaling_group_id: {get_resource: autoscaling_group}
+      scaling_adjustment: -1
+      cooldown: 60
+  cpu_high_alarm:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale up if CPU usage is higher than the given threshold
+      metric: cpu_util
+      aggregation_method: mean
+      granularity: 60
+      evaluation_periods: 1
+      threshold: {get_param: scaleup_cpu_threshold}
+      resource_type: instance
+      comparison_operator: gt
+      alarm_actions: [{get_attr: [scaleup_policy, signal_url]}]
+      query:
+        list_join:
+          - ''
+          - - {'=': {server_group: {get_param: "OS::stack_id"}}}
+  cpu_low_alarm:
+    type: OS::Aodh::GnocchiAggregationByResourcesAlarm
+    properties:
+      description: Scale down if CPU usage is lower than the given threshold
+      metric: cpu_util
+      aggregation_method: mean
+      granularity: 60
+      evaluation_periods: 1
+      threshold: {get_param: scaledown_cpu_threshold}
+      resource_type: instance
+      comparison_operator: lt
+      alarm_actions: [{get_attr: [scaledown_policy, signal_url]}]
+      query:
+        list_join:
+          - ''
+          - - {'=': {server_group: {get_param: "OS::stack_id"}}}
+  # ceilometer_cpu_high_alarm:
+  #   type: OS::Aodh::Alarm
+  #   properties:
+  #     meter_name: cpu_util
+  #     period: 60
+  #     evaluation_periods: 1
+  #     statistic: avg
+  #     comparison_operator: gt
+  #     threshold: 5.0
+  #     alarm_actions:
+  #       - {get_attr: [ scaleup_policy, signal_url ] }
+  #     repeat_actions: false
+  #     matching_metadata: { 'metadata.user_metadata.server_group': { get_param: "OS::stack_id" } }
+  # ceilometer_cpu_low_alarm:
+  #   type: OS::Aodh::Alarm
+  #   properties:
+  #     meter_name: cpu_util
+  #     period: 60
+  #     evaluation_periods: 1
+  #     statistic: avg
+  #     comparison_operator: lt
+  #     threshold: 1.0
+  #     alarm_actions:
+  #       - {get_attr: [ scaledown_policy, signal_url ] }
+  #     repeat_actions: false
+  #     matching_metadata: { 'metadata.user_metadata.server_group': { get_param: "OS::stack_id" } }
+
+outputs:
+  scale_up_url:
+    value: {get_attr: [scaleup_policy, alarm_url]}
+  scale_down_url:
+    value: {get_attr: [scaledown_policy, alarm_url]}
+  lb_ip:
+    value: {get_attr: [loadbalancer_public_ip, floating_ip_address]}
